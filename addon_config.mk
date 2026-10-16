@@ -24,9 +24,10 @@ osx:
 
 vs:
 	# realsense2.dll in lib/vs/x64 is copied next to the exe by the project generator.
+	# CUDA / OpenCL (the addon's GPU processing) are loaded at run time: nothing to link.
 
 linux64:
-	ADDON_LDFLAGS = -ludev -lpthread
+	ADDON_LDFLAGS = -ludev -lpthread -ldl
 
 linuxaarch64:
-	ADDON_LDFLAGS = -ludev -lpthread
+	ADDON_LDFLAGS = -ludev -lpthread -ldl

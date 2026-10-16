@@ -3,6 +3,7 @@
 //
 
 #include "ofxLibRealSense2.h"
+#include "ofxLibRealSense2Gpu.h"
 #include "ofxLibRealSense2Processing.h"
 #include "ofGLProgrammableRenderer.h"
 
@@ -15,6 +16,8 @@
 #include <map>
 #include <set>
 #include <thread>
+
+#include <glm/gtc/type_ptr.hpp>
 #ifdef TARGET_OSX
 #include <unistd.h>
 #endif
@@ -75,6 +78,12 @@ namespace
     }
 
     using ofxLibRealSense2Processing::parallelRows;
+
+    // A GPU call failed: processFrames() drops the GPU and redoes the frame on the CPU.
+    struct GpuError : std::runtime_error
+    {
+        using std::runtime_error::runtime_error;
+    };
 
     bool sameIntrinsics(const rs2_intrinsics& a, const rs2_intrinsics& b)
     {
@@ -506,7 +515,12 @@ bool ofxLibRealSense2::open(const std::string& requestedSerial, const Settings& 
         if (colorProfile) colorIntrinsics = colorProfile.as<rs2::video_stream_profile>().get_intrinsics();
         if (depthProfile && colorProfile) depthToColor = depthProfile.get_extrinsics_to(colorProfile);
         depthScale = 0.001f;
-        if (auto ds = device.first<rs2::depth_sensor>()) depthScale = ds.get_depth_scale();
+        stereoBaselineMM = 0.f;
+        for (auto&& s : device.query_sensors())
+        {
+            if (auto ds = s.as<rs2::depth_sensor>()) depthScale = ds.get_depth_scale();
+            if (auto dss = s.as<rs2::depth_stereo_sensor>()) stereoBaselineMM = dss.get_stereo_baseline();
+        }
     }
 
     std::string streams;
@@ -542,6 +556,8 @@ bool ofxLibRealSense2::open(const std::string& requestedSerial, const Settings& 
     bOpened = true;
     setupOptionParams();
     openCameraCount++;
+    setupProcessing();
+    stats.processing = describeProcessing();
     startThread();
     return true;
 }
@@ -641,13 +657,66 @@ ofxLibRealSense2::CloudOptions ofxLibRealSense2::getCloudOptions() const
 
 bool ofxLibRealSense2::processFrames(const rs2::frameset& input, Frames& out)
 {
+    gpuFrame = false;
+    if (gpu)
+    {
+        try
+        {
+            const bool any = processFrames(input, out, true);
+            gpuFrame = true;
+#ifdef OFXLIBREALSENSE2_VERIFY_GPU
+            // The same frame on the CPU (its temporal filter sees every frame too, so the two
+            // histories stay in step), compared bit for bit.
+            const uint64_t savedColor = lastColorFrame, savedDepth = lastDepthFrame, savedDropped = dropped;
+            processFrames(input, verifyFrames, false);
+            lastColorFrame = savedColor;
+            lastDepthFrame = savedDepth;
+            dropped = savedDropped;
+            auto differing = [](const void* a, const void* b, size_t count, size_t size) -> uint64_t {
+                uint64_t n = 0;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    n += std::memcmp(static_cast<const uint8_t*>(a) + i * size, static_cast<const uint8_t*>(b) + i * size, size) != 0;
+                }
+                return n;
+            };
+            auto comparePixels = [&](const auto& a, const auto& b) -> uint64_t {
+                if (a.size() != b.size()) return std::max<uint64_t>(1, std::max(a.size(), b.size()));
+                return differing(a.getData(), b.getData(), a.getWidth() * a.getHeight(), a.getBytesPerPixel());
+            };
+            verify.frames++;
+            verify.depth += comparePixels(out.depth, verifyFrames.depth);
+            if (out.hasBigDepth || verifyFrames.hasBigDepth) verify.bigDepth += comparePixels(out.bigDepth, verifyFrames.bigDepth);
+            if (out.hasRegistered) verify.registered += comparePixels(out.registered, verifyFrames.registered);
+            verify.colorMap += out.colorMap.size() != verifyFrames.colorMap.size()
+                ? 1 : differing(out.colorMap.data(), verifyFrames.colorMap.data(), out.colorMap.size(), sizeof(int));
+#endif
+            return any;
+        }
+        catch (const GpuError& e)
+        {
+            gpuFailed(e.what());
+        }
+    }
+    return processFrames(input, out, false);
+}
+
+bool ofxLibRealSense2::processFrames(const rs2::frameset& input, Frames& out, bool useGpu)
+{
     const bool flip = !settings.unmirror;
     const bool wantBigDepth = settings.usePointCloud && bigPointCloud && settings.enableRGB;
     const int threads = getBuildThreadCount();
+    auto gpuCheck = [&](bool ok) {
+        if (!ok) throw GpuError(gpu->getError());
+    };
 
     // librealsense's post-processing, in the order Intel recommends. The filters pass the
-    // other streams of the frame set through untouched.
+    // other streams of the frame set through untouched. On the GPU, everything after
+    // decimation runs in Processor::processDepth() - unless the camera isn't a stereo camera
+    // (no baseline for the disparity transform): then the filters run here and the GPU gets
+    // filtered depth.
     rs2::frameset fs = input;
+    ofxLibRealSense2Gpu::DepthFilters gpuFilters;
     if (fs.get_depth_frame())
     {
         const int dec = ofClamp(decimation.get(), 1, 8);
@@ -656,26 +725,46 @@ bool ofxLibRealSense2::processFrames(const rs2::frameset& input, Frames& out)
             decimationBlock.set_option(RS2_OPTION_FILTER_MAGNITUDE, static_cast<float>(dec));
             fs = fs.apply_filter(decimationBlock);
         }
-        if (spatialFilter || temporalFilter)
+        if (useGpu && stereoBaselineMM > 0.f)
         {
-            fs = fs.apply_filter(toDisparity);
-            if (spatialFilter)
-            {
-                // librealsense's spatial filter, multi-threaded (same output). The disparity
-                // frame was just made for us by toDisparity, so it's filtered in place.
-                if (auto disparity = fs.get_depth_frame())
-                {
-                    ofxLibRealSense2Processing::spatialFilter(static_cast<float*>(const_cast<void*>(disparity.get_data())),
-                        disparity.get_width(), disparity.get_height(),
-                        spatialBlock.get_option(RS2_OPTION_FILTER_SMOOTH_ALPHA),
-                        spatialBlock.get_option(RS2_OPTION_FILTER_SMOOTH_DELTA),
-                        static_cast<int>(spatialBlock.get_option(RS2_OPTION_FILTER_MAGNITUDE)), threads);
-                }
-            }
-            if (temporalFilter) fs = fs.apply_filter(temporalBlock);
-            fs = fs.apply_filter(toDepth);
+            const rs2::depth_frame d = fs.get_depth_frame();
+            gpuFilters.spatial = spatialFilter;
+            gpuFilters.spatialAlpha = spatialBlock.get_option(RS2_OPTION_FILTER_SMOOTH_ALPHA);
+            gpuFilters.spatialDelta = spatialBlock.get_option(RS2_OPTION_FILTER_SMOOTH_DELTA);
+            gpuFilters.spatialIterations = static_cast<int>(spatialBlock.get_option(RS2_OPTION_FILTER_MAGNITUDE));
+            gpuFilters.temporal = temporalFilter;
+            gpuFilters.temporalAlpha = temporalBlock.get_option(RS2_OPTION_FILTER_SMOOTH_ALPHA);
+            gpuFilters.temporalDelta = temporalBlock.get_option(RS2_OPTION_FILTER_SMOOTH_DELTA);
+            gpuFilters.temporalPersistence = static_cast<int>(temporalBlock.get_option(RS2_OPTION_HOLES_FILL));
+            // librealsense's disparity_info: baseline (m) * focal length (px) * 32 (5 fractional
+            // bits) / depth units, in this order
+            const float fx = d.get_profile().as<rs2::video_stream_profile>().get_intrinsics().fx;
+            gpuFilters.disparityFactor = (stereoBaselineMM * 0.001f * fx * 32) / d.get_units();
+            gpuFilters.holeFillMode = holeFilling ? static_cast<int>(holeFillingBlock.get_option(RS2_OPTION_HOLES_FILL)) : -1;
         }
-        if (holeFilling) fs = fs.apply_filter(holeFillingBlock);
+        else
+        {
+            if (spatialFilter || temporalFilter)
+            {
+                fs = fs.apply_filter(toDisparity);
+                if (spatialFilter)
+                {
+                    // librealsense's spatial filter, multi-threaded (same output), in place on the
+                    // disparity frame toDisparity just made. (get_depth_frame() only finds Z16.)
+                    if (auto disparity = fs.first_or_default(RS2_STREAM_DEPTH, RS2_FORMAT_DISPARITY32).as<rs2::video_frame>())
+                    {
+                        ofxLibRealSense2Processing::spatialFilter(static_cast<float*>(const_cast<void*>(disparity.get_data())),
+                            disparity.get_width(), disparity.get_height(),
+                            spatialBlock.get_option(RS2_OPTION_FILTER_SMOOTH_ALPHA),
+                            spatialBlock.get_option(RS2_OPTION_FILTER_SMOOTH_DELTA),
+                            static_cast<int>(spatialBlock.get_option(RS2_OPTION_FILTER_MAGNITUDE)), threads);
+                    }
+                }
+                if (temporalFilter) fs = fs.apply_filter(temporalBlock);
+                fs = fs.apply_filter(toDepth);
+            }
+            if (holeFilling) fs = fs.apply_filter(holeFillingBlock);
+        }
     }
 
     rs2::video_frame color = fs.get_color_frame();
@@ -710,12 +799,16 @@ bool ofxLibRealSense2::processFrames(const rs2::frameset& input, Frames& out)
         const int w = ir.get_width(), h = ir.get_height();
         out.ir.allocate(w, h, OF_PIXELS_GRAY);
         const uint8_t* src = static_cast<const uint8_t*>(ir.get_data());
+        const int stride = ir.get_stride_in_bytes();
         float* dst = out.ir.getData();
-        for (int y = 0; y < h; ++y)
-        {
-            const uint8_t* row = src + static_cast<size_t>(y) * ir.get_stride_in_bytes();
-            for (int x = 0; x < w; ++x) dst[y * w + x] = row[flip ? w - 1 - x : x];
-        }
+        parallelRows(h, threads, [&](int, int y0, int y1) {
+            for (int y = y0; y < y1; ++y)
+            {
+                const uint8_t* row = src + static_cast<size_t>(y) * stride;
+                float* o = dst + static_cast<size_t>(y) * w;
+                for (int x = 0; x < w; ++x) o[x] = row[flip ? w - 1 - x : x];
+            }
+        });
     }
     if (depth)
     {
@@ -724,16 +817,23 @@ bool ofxLibRealSense2::processFrames(const rs2::frameset& input, Frames& out)
         out.depth.allocate(w, h, OF_PIXELS_GRAY);
         const float toMM = depth.get_units() * 1000.f;
         const uint16_t* src = static_cast<const uint16_t*>(depth.get_data());
-        const int stride = depth.get_stride_in_bytes() / 2;
-        float* dst = out.depth.getData();
-        parallelRows(h, threads, [&](int, int y0, int y1) {
-            for (int y = y0; y < y1; ++y)
-            {
-                const uint16_t* row = src + static_cast<size_t>(y) * stride;
-                float* o = dst + static_cast<size_t>(y) * w;
-                for (int x = 0; x < w; ++x) o[x] = row[flip ? w - 1 - x : x] * toMM;
-            }
-        });
+        if (useGpu)
+        {
+            gpuCheck(gpu->processDepth(src, w, h, depth.get_stride_in_bytes(), gpuFilters, toMM, flip, out.depth.getData()));
+        }
+        else
+        {
+            const int stride = depth.get_stride_in_bytes() / 2;
+            float* dst = out.depth.getData();
+            parallelRows(h, threads, [&](int, int y0, int y1) {
+                for (int y = y0; y < y1; ++y)
+                {
+                    const uint16_t* row = src + static_cast<size_t>(y) * stride;
+                    float* o = dst + static_cast<size_t>(y) * w;
+                    for (int x = 0; x < w; ++x) o[x] = row[flip ? w - 1 - x : x] * toMM;
+                }
+            });
+        }
     }
 
     if (wantBigDepth && color && depth)
@@ -746,20 +846,27 @@ bool ofxLibRealSense2::processFrames(const rs2::frameset& input, Frames& out)
             extrinsics = depthToColor;
         }
         const int w = out.colorIntrinsics.width, h = out.colorIntrinsics.height;
-        bigDepthRaw.resize(static_cast<size_t>(w) * h);
-        ofxLibRealSense2Processing::alignDepthToOther(static_cast<const uint16_t*>(depth.get_data()), out.depthIntrinsics, extrinsics,
-                                                     out.colorIntrinsics, depth.get_units(), bigDepthRaw.data(), threads, alignScratch);
         out.bigDepth.allocate(w, h, OF_PIXELS_GRAY);
         const float toMM = depth.get_units() * 1000.f;
-        float* dst = out.bigDepth.getData();
-        parallelRows(h, threads, [&](int, int y0, int y1) {
-            for (int y = y0; y < y1; ++y)
-            {
-                const uint16_t* row = bigDepthRaw.data() + static_cast<size_t>(y) * w;
-                float* o = dst + static_cast<size_t>(y) * w;
-                for (int x = 0; x < w; ++x) o[x] = row[flip ? w - 1 - x : x] * toMM;
-            }
-        });
+        if (useGpu)
+        {
+            gpuCheck(gpu->alignDepth(out.depthIntrinsics, extrinsics, out.colorIntrinsics, depth.get_units(), toMM, flip, out.bigDepth.getData()));
+        }
+        else
+        {
+            bigDepthRaw.resize(static_cast<size_t>(w) * h);
+            ofxLibRealSense2Processing::alignDepthToOther(static_cast<const uint16_t*>(depth.get_data()), out.depthIntrinsics, extrinsics,
+                                                         out.colorIntrinsics, depth.get_units(), bigDepthRaw.data(), threads, alignScratch);
+            float* dst = out.bigDepth.getData();
+            parallelRows(h, threads, [&](int, int y0, int y1) {
+                for (int y = y0; y < y1; ++y)
+                {
+                    const uint16_t* row = bigDepthRaw.data() + static_cast<size_t>(y) * w;
+                    float* o = dst + static_cast<size_t>(y) * w;
+                    for (int x = 0; x < w; ++x) o[x] = row[flip ? w - 1 - x : x] * toMM;
+                }
+            });
+        }
         out.hasBigDepth = true;
     }
 
@@ -786,37 +893,52 @@ bool ofxLibRealSense2::processFrames(const rs2::frameset& input, Frames& out)
         const uint32_t* colorPx = reinterpret_cast<const uint32_t*>(out.color.getData());
         uint32_t* reg = out.hasRegistered ? reinterpret_cast<uint32_t*>(out.registered.getData()) : nullptr;
 
-        parallelRows(h, threads, [&](int, int y0, int y1) {
-            for (int y = y0; y < y1; ++y)
+        if (useGpu)
+        {
+            gpuCheck(gpu->colorMap(out.depthIntrinsics, rays.data(), colorIn, extrinsics, flip, map));
+            gpuCheck(gpu->finishFrame(threads));
+            if (reg)
             {
-                for (int x = 0; x < w; ++x)
-                {
-                    const size_t i = static_cast<size_t>(y) * w + x;
-                    const float z = d[i] * 0.001f;
-                    int c = -1;
-                    if (z > 0.f)
-                    {
-                        // stored images may be flipped: calibration is in the camera's own columns
-                        const int sx = flip ? w - 1 - x : x;
-                        const glm::vec2 r = rays[static_cast<size_t>(y) * w + sx];
-                        const float p[3] = { r.x * z, r.y * z, z };
-                        float q[3], px[2];
-                        rs2_transform_point_to_point(q, &extrinsics, p);
-                        rs2_project_point_to_pixel(px, &colorIn, q);
-                        const int cx = static_cast<int>(px[0] + 0.5f);
-                        const int cy = static_cast<int>(px[1] + 0.5f);
-                        if (cx >= 0 && cy >= 0 && cx < cw && cy < ch) c = cy * cw + (flip ? cw - 1 - cx : cx);
-                    }
-                    map[i] = c;
-                    if (reg) reg[i] = c >= 0 ? colorPx[c] : 0u;
-                }
+                parallelRows(h, threads, [&](int, int y0, int y1) {
+                    for (size_t i = static_cast<size_t>(y0) * w; i < static_cast<size_t>(y1) * w; ++i) reg[i] = map[i] >= 0 ? colorPx[map[i]] : 0u;
+                });
             }
-        });
+        }
+        else
+        {
+            parallelRows(h, threads, [&](int, int y0, int y1) {
+                for (int y = y0; y < y1; ++y)
+                {
+                    for (int x = 0; x < w; ++x)
+                    {
+                        const size_t i = static_cast<size_t>(y) * w + x;
+                        const float z = d[i] * 0.001f;
+                        int c = -1;
+                        if (z > 0.f)
+                        {
+                            // stored images may be flipped: calibration is in the camera's own columns
+                            const int sx = flip ? w - 1 - x : x;
+                            const glm::vec2 r = rays[static_cast<size_t>(y) * w + sx];
+                            const float p[3] = { r.x * z, r.y * z, z };
+                            float q[3], px[2];
+                            rs2_transform_point_to_point(q, &extrinsics, p);
+                            rs2_project_point_to_pixel(px, &colorIn, q);
+                            const int cx = static_cast<int>(px[0] + 0.5f);
+                            const int cy = static_cast<int>(px[1] + 0.5f);
+                            if (cx >= 0 && cy >= 0 && cx < cw && cy < ch) c = cy * cw + (flip ? cw - 1 - cx : cx);
+                        }
+                        map[i] = c;
+                        if (reg) reg[i] = c >= 0 ? colorPx[c] : 0u;
+                    }
+                }
+            });
+        }
     }
     else
     {
         out.colorMap.clear();
     }
+    if (useGpu) gpuCheck(gpu->finishFrame(threads)); // results of the queued GPU work
     return out.hasColor || out.hasDepth || out.hasIr;
 }
 
@@ -893,7 +1015,44 @@ void ofxLibRealSense2::threadedFunction()
             if (settings.usePointCloud)
             {
                 const uint64_t buildStart = ofGetElapsedTimeMicros();
-                buildPointCloud(back, options, cloudBack);
+                bool built = false;
+                if (gpu && gpuFrame)
+                {
+                    try
+                    {
+                        built = buildPointCloudGpu(back, options, cloudBack);
+                    }
+                    catch (const GpuError& e)
+                    {
+                        gpuFailed(e.what());
+                    }
+#ifdef OFXLIBREALSENSE2_VERIFY_GPU
+                    if (built)
+                    {
+                        buildPointCloud(back, options, verifyCloud);
+                        auto& a = cloudBack;
+                        auto& b = verifyCloud;
+                        const bool sameSize = a.positions.size() == b.positions.size() && a.normals.size() == b.normals.size()
+                            && a.texCoords.size() == b.texCoords.size() && a.colors.size() == b.colors.size();
+                        if (!sameSize) verify.cloudSize++;
+                        else
+                        {
+                            for (size_t i = 0; i < a.positions.size(); ++i)
+                            {
+                                const bool same = a.positions[i] == b.positions[i] && (a.normals.empty() || a.normals[i] == b.normals[i])
+                                    && (a.texCoords.empty() || a.texCoords[i] == b.texCoords[i]) && (a.colors.empty() || a.colors[i] == b.colors[i]);
+                                if (!same)
+                                {
+                                    verify.cloud++;
+                                    verify.maxCloudError = std::max(verify.maxCloudError, glm::length(a.positions[i] - b.positions[i]));
+                                }
+                            }
+                        }
+                        if (a.indices != b.indices) verify.indices++;
+                    }
+#endif
+                }
+                if (!built) buildPointCloud(back, options, cloudBack);
                 buildAverage = ofLerp(buildAverage, (ofGetElapsedTimeMicros() - buildStart) / 1000.f, 0.1f);
                 cloudInColourSpace = options.bigPointCloud && back.hasBigDepth;
             }
@@ -911,6 +1070,17 @@ void ofxLibRealSense2::threadedFunction()
         {
             if (auto d = fs.get_depth_frame()) offsetMs = static_cast<float>(std::abs(c.get_timestamp() - d.get_timestamp()));
         }
+
+#ifdef OFXLIBREALSENSE2_VERIFY_GPU
+        if (verify.frames >= 30)
+        {
+            ofLogNotice("ofxLibRealSense2 verify") << serial << " " << verify.frames << " frames, GPU vs CPU, differing values: depth " << verify.depth
+                                                   << ", aligned depth " << verify.bigDepth << ", colour map " << verify.colorMap << ", registered "
+                                                   << verify.registered << ", cloud vertices " << verify.cloud << " (max " << verify.maxCloudError
+                                                   << " m), cloud size mismatches " << verify.cloudSize << ", index list mismatches " << verify.indices;
+            verify = VerifyStats();
+        }
+#endif
 
         const uint64_t now = ofGetElapsedTimeMicros();
         if (lastFrameTime > 0) fpsAverage = ofLerp(fpsAverage, 1e6f / std::max<uint64_t>(1, now - lastFrameTime), 0.1f);
@@ -947,6 +1117,150 @@ int ofxLibRealSense2::getBuildThreadCount()
     const int hw = std::max(1u, std::thread::hardware_concurrency());
     const int cameras = std::max(1, openCameraCount.load());
     return ofClamp(hw / cameras, 1, 8);
+}
+
+std::string ofxLibRealSense2::toString(Processing processing)
+{
+    switch (processing)
+    {
+    case Processing::CUDA: return "CUDA";
+    case Processing::OPENCL: return "OpenCL";
+    case Processing::CPU: return "CPU";
+    default: return "default";
+    }
+}
+
+ofxLibRealSense2::Processing ofxLibRealSense2::getProcessing() const { return processingInUse; }
+
+std::vector<std::string> ofxLibRealSense2::listProcessingDevices(Processing api)
+{
+    std::vector<std::string> names;
+    if (api != Processing::CUDA && api != Processing::OPENCL) return names;
+    for (const auto& d : ofxLibRealSense2Gpu::listDevices(api == Processing::CUDA ? ofxLibRealSense2Gpu::Api::CUDA : ofxLibRealSense2Gpu::Api::OPENCL))
+    {
+        names.push_back(d.name);
+    }
+    return names;
+}
+
+void ofxLibRealSense2::setupProcessing()
+{
+    gpu.reset();
+    processingInUse = Processing::CPU;
+    // OFXLIBREALSENSE2_PROCESSING=cuda / opencl / cpu overrides Settings::processing, to try a
+    // machine's options without rebuilding the app.
+    Processing requested = settings.processing;
+    const std::string env = ofGetEnv("OFXLIBREALSENSE2_PROCESSING");
+    if (!env.empty())
+    {
+        const std::string e = ofToLower(env);
+        if (e == "cuda") requested = Processing::CUDA;
+        else if (e == "opencl") requested = Processing::OPENCL;
+        else if (e == "cpu") requested = Processing::CPU;
+        ofLogNotice("ofxLibRealSense2") << "OFXLIBREALSENSE2_PROCESSING=" << env << ": " << toString(requested);
+    }
+    std::vector<Processing> order;
+    switch (requested)
+    {
+    case Processing::DEFAULT: // the CPU: the GPU paths haven't been faster so far (see the README)
+        break;
+    case Processing::CUDA: order = { Processing::CUDA, Processing::OPENCL }; break;
+    case Processing::OPENCL: order = { Processing::OPENCL }; break;
+    case Processing::CPU: break;
+    }
+    for (size_t i = 0; i < order.size(); ++i)
+    {
+        std::string error;
+        const auto api = order[i] == Processing::CUDA ? ofxLibRealSense2Gpu::Api::CUDA : ofxLibRealSense2Gpu::Api::OPENCL;
+        // the device index is for the first API tried; fallbacks use their default GPU
+        gpu = ofxLibRealSense2Gpu::Processor::create(api, i == 0 ? settings.processingDevice : -1, error);
+        if (gpu)
+        {
+            processingInUse = order[i];
+            break;
+        }
+        ofLogNotice("ofxLibRealSense2") << serial << ": " << toString(order[i]) << " not available: " << error;
+    }
+    ofLogNotice("ofxLibRealSense2") << serial << ": processing on " << describeProcessing();
+}
+
+std::string ofxLibRealSense2::describeProcessing() const
+{
+    if (gpu) return toString(processingInUse) + " " + gpu->getDeviceName();
+    return "CPU " + ofToString(getBuildThreadCount()) + " threads";
+}
+
+void ofxLibRealSense2::gpuFailed(const std::string& what)
+{
+    ofLogError("ofxLibRealSense2") << serial << ": " << toString(processingInUse) << " processing failed (" << what << "), using the CPU";
+    gpu.reset();
+    processingInUse = Processing::CPU;
+    gpuFrame = false;
+    const std::string description = describeProcessing();
+    lock();
+    stats.processing = description;
+    unlock();
+}
+
+bool ofxLibRealSense2::buildPointCloudGpu(const Frames& frames, const CloudOptions& o, Cloud& cloud)
+{
+    // The same choices as buildPointCloud(), then the GPU builds it from the depth it still has.
+    const bool big = o.bigPointCloud && frames.hasBigDepth;
+    const ofFloatPixels& depthImage = big ? frames.bigDepth : frames.depth;
+    const rs2_intrinsics& intrinsics = big ? frames.colorIntrinsics : frames.depthIntrinsics;
+    const int w = static_cast<int>(depthImage.getWidth());
+    const int h = static_cast<int>(depthImage.getHeight());
+    if (w == 0 || h == 0 || intrinsics.width != w || intrinsics.height != h)
+    {
+        cloud.positions.clear();
+        cloud.normals.clear();
+        cloud.texCoords.clear();
+        cloud.colors.clear();
+        cloud.indices.clear();
+        return true;
+    }
+
+    const int threads = o.threads > 0 ? o.threads : getBuildThreadCount();
+    const auto& rays = raysFor(intrinsics, threads);
+    const float pixelRatio = (big && frames.depthIntrinsics.fx > 0.f) ? frames.colorIntrinsics.fx / frames.depthIntrinsics.fx : 1.f;
+
+    ofxLibRealSense2Gpu::CloudParams p;
+    p.big = big;
+    p.width = w;
+    p.height = h;
+    p.flip = frames.mirrored;
+    p.denoise = o.denoise;
+    p.denoiseSpacing = std::max(1, static_cast<int>(std::lround(pixelRatio)));
+    p.step = std::max(1, o.steps);
+    p.minZ = o.minDistance;
+    p.maxZ = o.maxDistance;
+    p.hasColor = frames.hasColor && frames.color.isAllocated() && (big || frames.colorMap.size() == static_cast<size_t>(w) * h);
+    p.colorWidth = p.hasColor ? static_cast<int>(frames.color.getWidth()) : 0;
+    p.channels = p.hasColor ? static_cast<int>(frames.color.getNumChannels()) : 0;
+    p.texCoords = o.texCoords;
+    p.alpha = o.alpha;
+    p.faces = o.faces;
+    const float gridScale = big ? p.step / pixelRatio : static_cast<float>(p.step);
+    const float maxEdge = o.facesMaxLength * std::max(1.f, gridScale);
+    p.maxEdge2 = maxEdge * maxEdge;
+    p.maxJump = o.facesMaxDepthJump * std::max(1.f, gridScale);
+    p.transform = o.transform;
+    if (o.transform)
+    {
+        const glm::mat4 m = o.transformation;
+        const glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(m)));
+        std::memcpy(p.matrix, glm::value_ptr(m), sizeof(p.matrix));
+        std::memcpy(p.normalMatrix, glm::value_ptr(normalMatrix), sizeof(p.normalMatrix));
+    }
+
+    if (p.hasColor && !p.texCoords
+        && !gpu->uploadColor(frames.color.getData(), static_cast<int>(frames.color.getWidth()), static_cast<int>(frames.color.getHeight()), p.channels))
+    {
+        throw GpuError(gpu->getError());
+    }
+    ofxLibRealSense2Gpu::CloudOutput out{ cloud.positions, cloud.normals, cloud.texCoords, cloud.colors, cloud.indices };
+    if (!gpu->buildCloud(p, intrinsics, rays.data(), out, threads)) throw GpuError(gpu->getError());
+    return true;
 }
 
 void ofxLibRealSense2::buildPointCloud(const Frames& frames, const CloudOptions& o, Cloud& cloud)
@@ -1254,6 +1568,8 @@ void ofxLibRealSense2::close()
     if (bOpened)
     {
         waitForThread(true);
+        gpu.reset();
+        processingInUse = Processing::CPU;
         try
         {
             pipeline.stop();

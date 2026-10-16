@@ -203,7 +203,7 @@ void ofApp::draw()
 	{
 		auto& camera = cameras[currentCamera];
 		const auto stats = camera->getCaptureStats();
-		status = "Device " + ofToString(currentCamera + 1) + "/" + ofToString(cameras.size()) + " (" + camera->getSerial() + ", " + stats.pipeline +
+		status = "Device " + ofToString(currentCamera + 1) + "/" + ofToString(cameras.size()) + " (" + camera->getSerial() + ", " + stats.pipeline + ", " + stats.processing +
 			", librealsense " + ofxLibRealSense2::getLibraryVersion() + "): " + ofToString(stats.fps, 1) + " fps, " +
 			ofToString(stats.processMs, 1) + " ms per frame (cloud " + ofToString(stats.buildMs, 1) + " ms)";
 		if (stats.colorDepthOffsetMs >= 0) status += ", colour-depth " + ofToString(stats.colorDepthOffsetMs, 1) + " ms";

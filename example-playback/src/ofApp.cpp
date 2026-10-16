@@ -120,7 +120,7 @@ void ofApp::draw()
 	{
 		const auto stats = camera.getCaptureStats();
 		status = (camera.isPlayback() ? "PLAYING " + ofFilePath::getFileName(camera.getSettings().playbackFile) : recording ? "RECORDING " + ofFilePath::getFileName(lastRecording) : "LIVE")
-			+ "  " + stats.pipeline + "  " + ofToString(stats.fps, 1) + " fps, " + ofToString(stats.processMs, 1) + " ms per frame";
+			+ "  " + stats.pipeline + ", " + stats.processing + "  " + ofToString(stats.fps, 1) + " fps, " + ofToString(stats.processMs, 1) + " ms per frame";
 		if (camera.isPlayback()) status += "  " + ofToString(camera.getPosition(), 1) + " / " + ofToString(camera.getDuration(), 1) + " s";
 	}
 	ofDrawBitmapStringHighlight(status, 10, ofGetHeight() - 30, recording ? ofColor(160, 0, 0) : ofColor::black);

@@ -141,6 +141,47 @@ namespace ofxLibRealSense2Processing
         }
     }
 
+    /// librealsense's hole filling (hole_filling_filter, RS2_OPTION_HOLES_FILL modes 0 fill
+    /// from left, 1 farthest from around, 2 nearest from around) in place on 16-bit depth,
+    /// for the GPU path, which filters on the GPU and fills here. Sequential, as librealsense's:
+    /// each pixel can take a neighbour filled just before.
+    inline void holeFill(uint16_t* image, int width, int height, int mode)
+    {
+        uint16_t* p = image;
+        if (mode == 0)
+        {
+            for (int j = 0; j < height; ++j)
+            {
+                ++p;
+                for (int i = 1; i < width; ++i)
+                {
+                    if (!*p) *p = *(p - 1);
+                    ++p;
+                }
+            }
+            return;
+        }
+        p = image + width;
+        for (int j = 1; j < height - 1; ++j)
+        {
+            ++p;
+            for (int i = 1; i < width; ++i)
+            {
+                if (!*p)
+                {
+                    const uint16_t* n[4] = { p - width - 1, p - 1, p + width - 1, p + width };
+                    uint16_t tmp = *(p - width);
+                    for (const uint16_t* q : n)
+                    {
+                        if (mode == 1 ? *q > tmp : (*q && *q < tmp)) tmp = *q;
+                    }
+                    *p = tmp;
+                }
+                ++p;
+            }
+        }
+    }
+
     /// Depth (16-bit, `scale` metres per unit) re-projected into another camera: each depth
     /// pixel's footprint is mapped through the calibration and filled with its depth, keeping
     /// the nearest where footprints overlap - librealsense's align (align_z_to_other).

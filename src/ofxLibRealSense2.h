@@ -25,6 +25,8 @@
 #include <memory>
 #include <mutex>
 
+namespace ofxLibRealSense2Gpu { class Processor; }
+
 class ofxLibRealSense2: public ofThread
 {
 public:
@@ -47,6 +49,21 @@ public:
         MASTER = 1,
         SLAVE = 2
     };
+
+    /// Where the capture thread's processing runs: the depth filters (disparity, spatial,
+    /// temporal), depth images, align, colour map and point cloud / mesh. The GPU versions
+    /// give the same results as the CPU. CUDA and OpenCL are loaded at run time - nothing to
+    /// install or ship beyond the GPU driver - and when one isn't there the next is tried.
+    /// The GPU paths are opt-in: on the machine they were tested on (GTX 1080 Ti, i7-7700K)
+    /// they were no faster than the CPU (see the README).
+    enum class Processing
+    {
+        DEFAULT = 0, ///< the CPU
+        CUDA = 1,    ///< NVIDIA GPU (driver 530+), then OpenCL, then CPU
+        OPENCL = 2,  ///< any OpenCL 1.2 GPU, then CPU
+        CPU = 3      ///< multi-threaded CPU
+    };
+    static std::string toString(Processing processing);
 
     struct Settings
     {
@@ -90,6 +107,12 @@ public:
         bool spatialFilter = true;   ///< edge-preserving smoothing
         bool temporalFilter = true;  ///< smoothing over time (adds a little lag)
         bool holeFilling = false;
+
+        /// CPU or GPU processing (see Processing); getProcessing() says what was picked.
+        Processing processing = Processing::DEFAULT;
+        /// GPU index for CUDA / OpenCL (see listProcessingDevices()), -1 for the default:
+        /// CUDA device 0, the OpenCL discrete GPU with the most compute units.
+        int processingDevice = -1;
 
         /// Multi-camera hardware sync (see SyncMode).
         SyncMode syncMode = SyncMode::DEFAULT;
@@ -137,6 +160,12 @@ public:
     const Settings& getSettings() const { return settings; }
     bool isPlayback() const { return !settings.playbackFile.empty(); }
 
+    /// The processing in use (after any fallback; CPU if a GPU failed while running).
+    Processing getProcessing() const;
+    /// The GPUs CUDA or OpenCL can use (index = Settings::processingDevice); empty when the
+    /// API isn't available.
+    static std::vector<std::string> listProcessingDevices(Processing api);
+
     /// Capture thread timing (running averages): frames per second delivered, time spent
     /// processing each frame after it arrives (filters, registration, flips, depth / IR
     /// images, point cloud), and the point cloud's share of it. With several cameras each one
@@ -153,6 +182,7 @@ public:
         bool connected = true;
         std::string lastError;
         std::string pipeline;          ///< what's streaming, e.g. "D415 USB 3.2 1280x720@30"
+        std::string processing;        ///< e.g. "CUDA NVIDIA GeForce GTX 1080 Ti (sm_61)", "CPU 8 threads"
         uint64_t droppedFrames = 0;
         float colorDepthOffsetMs = -1; ///< -1: unknown
     };
@@ -350,6 +380,13 @@ public:
 protected:
     void threadedFunction() override;
     bool processFrames(const rs2::frameset& frameset, Frames& out);
+    /// useGpu: run on `gpu`; throws GpuError when it fails.
+    bool processFrames(const rs2::frameset& frameset, Frames& out, bool useGpu);
+    bool buildPointCloudGpu(const Frames& frames, const CloudOptions& options, Cloud& cloud);
+    void setupProcessing();
+    /// A GPU call failed on the capture thread: log, drop the GPU, carry on with the CPU.
+    void gpuFailed(const std::string& what);
+    std::string describeProcessing() const;
     CloudOptions getCloudOptions() const;
     void setupOptionParams();
     void setSensorOption(bool colour, rs2_option option, float value);
@@ -381,6 +418,18 @@ protected:
     rs2::hole_filling_filter holeFillingBlock;
     std::vector<uint16_t> bigDepthRaw;
     ofxLibRealSense2Processing::AlignScratch alignScratch;
+
+    // GPU processing (null: CPU). Created in open(), used and dropped on the capture thread.
+    std::unique_ptr<ofxLibRealSense2Gpu::Processor> gpu;
+    std::atomic<Processing> processingInUse{ Processing::CPU };
+    float stereoBaselineMM = 0.f; // for the GPU's disparity transform, 0 = not a stereo camera
+    bool gpuFrame = false;        // the frame in `back` was processed on the GPU (its data is still there)
+#ifdef OFXLIBREALSENSE2_VERIFY_GPU
+    // Debug: every GPU frame is also processed on the CPU and compared (see processFrames()).
+    Frames verifyFrames;
+    Cloud verifyCloud;
+    struct VerifyStats { uint64_t frames = 0, depth = 0, bigDepth = 0, colorMap = 0, registered = 0, cloudSize = 0, cloud = 0, indices = 0; float maxCloudError = 0.f; } verify;
+#endif
     uint64_t lastColorFrame = 0;
     uint64_t lastDepthFrame = 0;
     uint64_t dropped = 0;

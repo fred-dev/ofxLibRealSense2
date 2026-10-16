@@ -11,11 +11,26 @@ and tested; this file says what exists, what still has to happen per platform, a
   master, RealSense D415 (firmware updated to the current release during testing). All five
   examples build from projectGenerator projects with no edits and stream. Static universal
   library (arm64 + x86_64) in `libs/librealsense2/lib/osx`.
-- **Windows and Linux have not been built yet.** `build_librealsense_windows.ps1` and
-  `build_librealsense_linux.sh` match the macOS options but have never run: expect small fixes.
-  There are no Windows / Linux libraries in the repo (`lib/vs`, `lib/linux64` don't exist).
-- The addon code (`src/`) is platform-neutral C++17 and only uses librealsense's public API; it
-  has only been compiled with Apple Clang so far. MSVC and GCC may find things Clang didn't.
+- **Windows is built and tested** (2026-10-16): Windows 10, VS 2026 (MSVC 14.51; 14.44 for the
+  CUDA build of librealsense), CUDA 12.1, i7-7700K + GTX 1080 Ti, D415 on USB 3.2. `realsense2.dll`
+  with librealsense's CUDA colour conversion is in `lib/vs/x64` (system DLLs only). The addon
+  compiles warning-free with MSVC; `example-streams` streams at 30 fps and exits cleanly. Timings
+  are in the main README. What the script needed is in `scripts/README.md` (Windows).
+- **Linux has not been built yet.** `build_librealsense_linux.sh` matches the macOS options but
+  has never run: expect small fixes. There is no `lib/linux64` yet.
+- **Bug found on Windows, affects every platform:** the spatial filter never ran. After
+  `toDisparity` the frame is `DISPARITY32` and `frameset::get_depth_frame()` only returns `Z16`,
+  so the addon's filter got no frame. Fixed (`first_or_default(RS2_STREAM_DEPTH,
+  RS2_FORMAT_DISPARITY32)`). The macOS timings in the README predate the fix: **measure macOS
+  again** (expect +1.5-1.9 ms).
+- **New: optional GPU processing** (`Settings::processing` = CUDA / OPENCL; default CPU),
+  `src/ofxLibRealSense2Gpu.*` and `src/ofxLibRealSense2Kernels.h`. It reproduces the CPU path bit
+  for bit (filters, depth images, align, colour map, cloud / mesh, transform) - checked on live
+  frames in every mode with `OFXLIBREALSENSE2_VERIFY_GPU` defined, which runs both and logs
+  differing values every 30 frames. On the 1080 Ti it was no faster than the CPU (transfers and
+  waits dominate while the app draws on the same GPU), so it's off by default. On Linux: try
+  `OFXLIBREALSENSE2_PROCESSING=cuda` / `opencl` and compare `processMs`; GCC hasn't compiled it
+  yet (`addon_config.mk` links `-ldl` for the run-time loading).
 
 ## Rules
 
@@ -103,26 +118,22 @@ network access the first time. One Release DLL serves Debug and Release apps (C 
 - A camera that's listed but won't open: another app has it (RealSense Viewer, a browser using the
   RGB camera as a webcam, Logitech G HUB...).
 
-Things likely to need attention:
+What came up (2026-10-16):
 
-- **The DLL next to the exe.** ofxKinectV2 relies on the projectGenerator copying the DLLs from
-  `lib/vs/x64` (via the project's `dll/x64`) next to the exe. Check it happens for
-  `realsense2.dll`; if not, add a post-build copy and note it.
-- **Frame metadata.** Without it librealsense falls back to host timestamps and some options
-  (per-frame exposure etc.) are missing. Intel enables it with a registry script:
-  `librealsense\scripts\realsense_metadata_win10.ps1` (run once as administrator with the camera
-  plugged in). Check what `getCaptureStats().colorDepthOffsetMs` says with and without it.
-- **CUDA** is deliberately off (see `scripts/README.md`): librealsense would only use it for colour
-  conversion, and a CUDA build drags in cuBLAS / cuSPARSE DLLs. Only revisit with measurements.
-  If you do: `-Cuda` adds sm_52 / sm_61 (librealsense's list skips desktop Pascal, e.g. 1080 Ti).
-- **MSVC vs the addon code.** Things Clang accepted that MSVC may not: the `goto`-based state
-  machine in `ofxLibRealSense2Processing.h` (a transcription of librealsense's; keep it identical
-  rather than restructuring), `thread_local` caches in `ofxLibRealSense2.cpp`, narrowing warnings.
-  Fix so Clang and GCC still build.
-- On the Windows OF build the first `ofLog` crashed unless `ofLogToConsole()` was called (found
-  with ofxKinectV2); all examples call it.
-- Several cameras: Windows needs each camera on a USB 3 controller with enough bandwidth, the same
-  as elsewhere.
+- **The DLL next to the exe:** works. The projectGenerator puts `realsense2.dll` in the project's
+  `dll/x64` and the template's post-build step copies it next to the exe.
+- **projectGenerator:** its command line takes long options only (`--ofPath=... --platforms=vs
+  --template=vs2026 --addons=ofxGui,ofxLibRealSense2 <project>`); it reported "cannot find vs2026"
+  and used the `vs` template (v143). Build with the toolset openframeworksLib uses
+  (`msbuild /p:PlatformToolset=v145`, or set it in the project).
+- **Frame metadata:** not set up (Intel's registry script wasn't run); `colorDepthOffsetMs` showed
+  0.3 ms anyway. Not investigated further.
+- **CUDA:** librealsense's own is now on in the Windows build (colour conversion), shippable - see
+  `scripts/README.md` for what the script does about cuBLAS / cuSPARSE, sm_61 and nvcc's host
+  compiler. The addon's own GPU processing is separate and off by default (see above).
+- **MSVC vs the addon code:** compiled without warnings in the addon's files; no changes needed.
+- The `control_transfer ... timed out` warnings seen on macOS: not checked (they only show with OF_LOG_VERBOSE); no errors were logged.
+- Several cameras: not tested (one D415).
 
 ## Linux
 
